@@ -1,8 +1,23 @@
 # ima-handoff（DSH 跨设备记忆与任务交接 Skill）
 
 在多台电脑的 DeepSeek Harness (DSH) 之间通过腾讯 ima 云端笔记无缝衔接开发进度。
-所有同步内容汇总在同一篇《DSH开发任务交接》总文档，通过每条记录上的**结构化元数据标签**
+所有同步内容汇总在同一篇交接笔记里，通过每条记录上的**结构化元数据标签**
 （时间 / 项目 / 会话ID / 设备）区分不同对话，实现“一篇文档、多会话隔离”。
+
+## 0. 安装 / 更新
+
+仓库：https://github.com/IvanYang9527/ima-handoff
+
+```bash
+# 首次安装：克隆到 DSH 技能目录
+git clone https://github.com/IvanYang9527/ima-handoff.git ~/.dsh/skills/ima-handoff
+
+# 后续更新
+cd ~/.dsh/skills/ima-handoff && git pull
+```
+
+> 本仓库是**唯一源**。日常改动请在这里提交并推送，再 `git pull` 到各机器的
+> `~/.dsh/skills/ima-handoff/`，避免多台机器各自修改导致分叉。
 
 ## 1. 核心能力
 
