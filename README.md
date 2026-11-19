@@ -21,7 +21,9 @@ cd ~/.dsh/skills/ima-handoff && git pull
 
 ## 1. 核心能力
 
-- **官方端点**：`https://ima.qq.com/openapi/note/v1/` 下的 `search_note`、`get_doc_content`、`append_doc`、`import_doc`。
+- **两层结构**：`《笔记本》/《笔记》`。笔记本是分类容器，笔记存交接记录；两者名称都可自定义。
+- **官方端点**：`https://ima.qq.com/openapi/note/v1/` 下的 `search_note`、`list_notebook`、
+  `list_note`、`add_notebook`、`get_doc_content`、`append_doc`、`import_doc`。
 - **官方鉴权头**：`ima-openapi-clientid` 与 `ima-openapi-apikey`。
 - **结构化元数据标签**：每条写入生成一个独立分隔块，形如：
   ```markdown
@@ -35,30 +37,30 @@ cd ~/.dsh/skills/ima-handoff && git pull
   保证同一工作区多次 write 归入同一会话，不会碎片化。
 - **按会话精准读取**：`read --session <ID>` 只返回该会话最新一条完整记录；不带参数则返回
   最近 3 个不同会话的摘要索引（`--all` 全部，`--json` 结构化）。
-- **并发安全**：多窗口各带自己的会话ID 往同一篇总笔记追加，时间线独立、互不覆盖。
+- **并发安全**：多窗口各带自己的会话ID 往同一篇笔记追加，时间线独立、互不覆盖。
 - **降级保护**：网络异常 / 配额耗尽时自动暂存至 `~/.dsh/handoff_fallback.md`。
 
 ## 2. 安装部署
 
 将 `ima-handoff` 文件夹完整放置于全局 DSH 技能目录：`~/.dsh/skills/ima-handoff/`。
 
-## 3. 初始化（推荐，新电脑首次使用）
+## 3. 初始化
 
-放置好目录后，在**本地终端**运行一次交互向导：
+**推荐在 DSH 对话里完成**：对 DSH 说“初始化 ima 交接”，它会用选项询问笔记本名 / 凭证 / 是否验证，
+然后自动执行。等价命令：
 
 ```bash
-python3 ~/.dsh/skills/ima-handoff/ima_sync.py init
+python3 ~/.dsh/skills/ima-handoff/ima_sync.py init \
+  --notebook "DSH内容同步空间" --note-title "DSH开发任务交接" --keep-credentials
 ```
 
-向导依次完成：
-1. **命名交接笔记本（同步空间）**：输入自定义名称，回车沿用默认《DSH开发任务交接》；
-   名称保存到 `~/.dsh/handoff_config.json`，之后 read/write 默认用它。
-2. **绑定凭证**：粘贴 `Client_ID` / `API_Key`，选择写入 `~/.config/ima/`（推荐）
-   或按提示自行 `export`。
-3. **连通性验证**：向该笔记本追加一条测试记录，确认云端可用。
+参数说明：
+- `--notebook` 笔记本名（同步空间，默认《DSH内容同步空间》）
+- `--note-title` 交接笔记名（默认《DSH开发任务交接》）
+- `--keep-credentials` 沿用现有凭证；或用 `--client-id` / `--api-key` 写入新的
+- `--no-verify` 跳过验证；`--no-create` 不创建笔记本（**笔记本建了删不掉**）
 
-非交互环境（无 TTY）下向导只打印指引、不阻塞输入；此时请在本地终端手动运行一次。
-跳过交互直接验证可用：`python3 ima_sync.py init --check`。
+只做只读验证：`python3 ima_sync.py init --check`
 
 ## 4. 手动配置凭证（可选）
 

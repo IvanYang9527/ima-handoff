@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 BASE_URL = os.getenv("IMA_BASE_URL", "https://ima.qq.com").rstrip("/")
+DEFAULT_NOTEBOOK = "DSH内容同步空间"
 DEFAULT_TITLE = "DSH开发任务交接"
 FALLBACK_FILE = Path.home() / ".dsh" / "handoff_fallback.md"
 SESSION_CACHE_DIR = Path.home() / ".dsh" / "handoff_sessions"
@@ -66,6 +67,10 @@ def save_config(cfg: dict) -> None:
 
 def default_title() -> str:
     return load_config().get("note_title") or DEFAULT_TITLE
+
+
+def default_notebook() -> str:
+    return load_config().get("notebook") or DEFAULT_NOTEBOOK
 
 
 def load_credentials():
@@ -188,8 +193,78 @@ def extract_notes_list(data: dict) -> list:
     return []
 
 
+def find_notebook_id(name: str) -> str:
+    """按名称精确查找笔记本（folder）ID，逐页扫描。找不到返回空串。"""
+    target = (name or "").strip()
+    if not target:
+        return ""
+    cursor = "0"
+    for _ in range(20):  # 防御性上限
+        res = request_ima(
+            "/openapi/note/v1/list_notebook", {"cursor": cursor, "limit": 20}
+        )
+        data = res.get("data", {}) or {}
+        for f in data.get("note_folder_infos") or []:
+            if (f.get("name") or "").strip() == target:
+                return f.get("folder_id") or ""
+        if data.get("is_end"):
+            break
+        cursor = data.get("next_cursor") or ""
+        if not cursor:
+            break
+    return ""
+
+
+def create_notebook(name: str) -> str:
+    """创建笔记本，返回 folder_id。名称重复时（210030）改为查找已有。"""
+    try:
+        res = request_ima(
+            "/openapi/note/v1/add_notebook", {"folder_name": name.strip()}
+        )
+        data = res.get("data", {}) or {}
+        fid = data.get("folder_id") or ""
+        if fid:
+            return fid
+    except RuntimeError as e:
+        # 210030 = 笔记本名称重复，退回查找
+        if "210030" not in str(e):
+            raise
+    return find_notebook_id(name)
+
+
+def ensure_notebook(name: str) -> str:
+    """确保笔记本存在，返回 folder_id（不存在则创建）。"""
+    fid = find_notebook_id(name)
+    if fid:
+        return fid
+    return create_notebook(name)
+
+
+def find_note_in_notebook(title: str, folder_id: str) -> str:
+    """在指定笔记本内按标题精确查找 note_id。folder_id 为空则退回全局搜索。"""
+    if not folder_id:
+        return find_note_id(title)
+    target = title.strip()
+    cursor = ""
+    for _ in range(20):
+        res = request_ima(
+            "/openapi/note/v1/list_note",
+            {"folder_id": folder_id, "sort_type": 0, "cursor": cursor, "limit": 20},
+        )
+        data = res.get("data", {}) or {}
+        for nb in data.get("note_book_list") or []:
+            if (nb.get("title") or "").strip() == target:
+                return nb.get("note_id") or ""
+        if data.get("is_end"):
+            break
+        cursor = data.get("next_cursor") or ""
+        if not cursor:
+            break
+    return ""
+
+
 def find_note_id(title: str) -> str:
-    """按标题精确查找 note_id。
+    """按标题精确查找 note_id（全局搜索）。
 
     官方 search_note 参数为 query_info.title（不是 keyword），结果是模糊匹配，
     因此必须自己按标题精确比对，否则会把内容追加到无关笔记上。
@@ -351,11 +426,33 @@ def print_fallback() -> None:
 
 # ------------------------------ 命令处理 ------------------------------
 
-def handle_read(title: str, session: Optional[str], show_all: bool, as_json: bool):
+def resolve_note(title: str, notebook: Optional[str] = None,
+                 create_notebook_if_missing: bool = False) -> tuple:
+    """解析出 (note_id, folder_id)。
+
+    两层结构：笔记本(notebook) 下放一篇交接笔记(title)。
+    - 给了 notebook：先定位/创建笔记本，再在其中按标题找笔记
+    - 没给 notebook：退回全局按标题搜索（兼容旧用法）
+    """
+    folder_id = ""
+    nb = (notebook or "").strip()
+    if nb:
+        folder_id = (ensure_notebook(nb) if create_notebook_if_missing
+                     else find_notebook_id(nb))
+        if folder_id:
+            note_id = find_note_in_notebook(title, folder_id)
+            if note_id:
+                return note_id, folder_id
+    return find_note_id(title), folder_id
+
+
+def handle_read(title: str, session: Optional[str], show_all: bool, as_json: bool,
+                notebook: Optional[str] = None):
     try:
-        note_id = find_note_id(title)
+        note_id, folder_id = resolve_note(title, notebook)
         if not note_id:
-            print(f"云端暂未找到标题为《{title}》的交接笔记。")
+            where = f"笔记本《{notebook}》中" if notebook else "云端"
+            print(f"{where}暂未找到标题为《{title}》的交接笔记。")
             print_fallback()
             return
         res = request_ima(
@@ -407,7 +504,8 @@ def save_fallback(project: str, session_id: str, host: str, content: str, reason
 
 
 def handle_write(title: str, project: str, content: str,
-                 session: Optional[str], host: Optional[str]):
+                 session: Optional[str], host: Optional[str],
+                 notebook: Optional[str] = None):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sid, source = resolve_session(session)
     hostname = local_hostname(host)
@@ -420,27 +518,31 @@ def handle_write(title: str, project: str, content: str,
 
     print(f"本次会话ID：{sid}（来源：{source}）；设备：{hostname}")
     try:
-        note_id = find_note_id(title)
+        note_id, folder_id = resolve_note(
+            title, notebook, create_notebook_if_missing=True
+        )
         if note_id:
             # 官方标准：append_doc 传入 note_id, content, content_format=1 (Markdown)
             res = request_ima(
                 "/openapi/note/v1/append_doc",
                 {"note_id": note_id, "content": formatted_block, "content_format": 1},
             )
+            loc = f"笔记本《{notebook}》" if notebook else "云端"
             print(
-                f"已追加同步至腾讯 ima 笔记《{title}》(note_id={note_id})："
+                f"已追加同步至{loc}笔记《{title}》(note_id={note_id})："
                 f"{json.dumps(res.get('data', {}), ensure_ascii=False)}"
             )
         else:
             # 官方标准：import_doc 无 title 字段，标题取正文首行 "# 标题"
             full_md = f"# {title}\n{formatted_block}"
-            res = request_ima(
-                "/openapi/note/v1/import_doc",
-                {"content": full_md, "content_format": 1},
-            )
+            payload = {"content": full_md, "content_format": 1}
+            if folder_id:
+                payload["folder_id"] = folder_id  # 直接建到指定笔记本
+            res = request_ima("/openapi/note/v1/import_doc", payload)
             note_id = (res.get("data") or {}).get("note_id") or ""
+            loc = f"笔记本《{notebook}》" if notebook else "云端"
             print(
-                f"已新建并同步至腾讯 ima 笔记《{title}》(note_id={note_id})："
+                f"已新建并同步至{loc}笔记《{title}》(note_id={note_id})："
                 f"{json.dumps(res.get('data', {}), ensure_ascii=False)}"
             )
         print(f"写入完成。本次会话后续继续带 --session {sid} 即可归入同一会话。")
@@ -497,25 +599,31 @@ def _save_credentials(client_id: str, api_key: str) -> bool:
         return False
 
 
-def _verify_readonly(title: str) -> bool:
+def _verify_readonly(title: str, notebook: Optional[str] = None) -> bool:
     """只读验证：不写入任何内容。返回是否成功。"""
     cid, key = load_credentials()
     if not cid or not key:
         print("✗ 凭证缺失，无法验证。")
         return False
     try:
-        note_id = find_note_id(title)
+        folder_id = find_notebook_id(notebook) if notebook else ""
+        note_id = find_note_in_notebook(title, folder_id) if folder_id else find_note_id(title)
+        nb_desc = f"笔记本《{notebook}》" if notebook else "云端"
+        if folder_id:
+            print(f"✓ 笔记本《{notebook}》已存在 (folder_id={folder_id})")
+        elif notebook:
+            print(f"· 笔记本《{notebook}》尚未创建，首次 write 时会自动新建")
         if note_id:
             res = request_ima(
                 "/openapi/note/v1/get_doc_content",
                 {"note_id": note_id, "target_content_format": 1},
             )
             blocks = parse_blocks(_extract_content(res.get("data", res)))
-            print(f"✓ 云端连通正常：笔记《{title}》已存在"
+            print(f"✓ 云端连通正常：{nb_desc}笔记《{title}》已存在"
                   f"(note_id={note_id})，现有 {len(blocks)} 条交接记录。")
         else:
             print("✓ 云端连通正常：凭证有效、检索可用。")
-            print(f"  笔记《{title}》尚未创建，首次执行 write 时会自动新建。")
+            print(f"  {nb_desc}笔记《{title}》尚未创建，首次执行 write 时会自动新建。")
         return True
     except Exception as e:
         print(f"✗ 云端连通失败：{e}", file=sys.stderr)
@@ -523,21 +631,26 @@ def _verify_readonly(title: str) -> bool:
         return False
 
 
-def handle_init_apply(title=None, client_id=None, api_key=None,
-                      keep_credentials=False, verify=True) -> int:
+def handle_init_apply(notebook=None, note_title=None, client_id=None, api_key=None,
+                      keep_credentials=False, verify=True, create=True) -> int:
     """非交互式初始化：由 DSH 在对话中收集答案后直接调用。
 
-    只做三件事：保存笔记本名 → 按需保存凭证 → 只读验证。
+    两层结构：notebook（笔记本）+ note_title（交接笔记）。
+    只做：保存名称 → 按需建笔记本 → 按需保存凭证 → 只读验证。
     """
     print("=" * 56)
     print(" ima-handoff 初始化")
     print("=" * 56)
 
     cfg = load_config()
-    final_title = (title or "").strip() or cfg.get("note_title") or DEFAULT_TITLE
+    final_nb = (notebook or "").strip() or cfg.get("notebook") or DEFAULT_NOTEBOOK
+    final_title = ((note_title or "").strip()
+                   or cfg.get("note_title") or DEFAULT_TITLE)
+    cfg["notebook"] = final_nb
     cfg["note_title"] = final_title
     save_config(cfg)
-    print(f"\n✓ 交接笔记本：《{final_title}》")
+    print(f"\n✓ 交接笔记本：《{final_nb}》")
+    print(f"✓ 交接笔记  ：《{final_title}》")
     print(f"  已保存到 {CONFIG_FILE}")
 
     if client_id or api_key:
@@ -557,16 +670,28 @@ def handle_init_apply(title=None, client_id=None, api_key=None,
             print("⚠ 未检测到现有凭证，请补充 Client ID / API Key。", file=sys.stderr)
             return 1
 
+    # 按需创建笔记本（创建后不可删，因此默认只在明确要求时建）
+    if create and (client_id or api_key or keep_credentials):
+        try:
+            fid = find_notebook_id(final_nb)
+            if fid:
+                print(f"✓ 笔记本已存在 (folder_id={fid})")
+            else:
+                fid = create_notebook(final_nb)
+                print(f"✓ 已创建笔记本《{final_nb}》(folder_id={fid})")
+        except Exception as e:
+            print(f"✗ 笔记本创建/查询失败：{e}", file=sys.stderr)
+
     ok = True
     if verify:
         print("\n【连通性验证】")
-        ok = _verify_readonly(final_title)
+        ok = _verify_readonly(final_title, final_nb)
     else:
         print("\n已跳过连通性验证。可稍后执行：ima_sync.py init --check")
 
     print("\n" + "=" * 56)
     print("初始化完成！之后直接说“保存进度 / 读取交接”即可。")
-    print(f"当前交接笔记本：《{final_title}》")
+    print(f"当前交接位置：《{final_nb}》 / 《{final_title}》")
     print("=" * 56)
     return 0 if ok else 1
 
@@ -666,20 +791,25 @@ if __name__ == "__main__":
     subparsers = parser.add_subparsers(dest="action", required=True)
 
     init_parser = subparsers.add_parser(
-        "init", help="初始化：命名笔记本 + 绑定凭证 + 连通性验证"
+        "init", help="初始化：命名笔记本 + 交接笔记 + 绑定凭证 + 连通性验证"
     )
     init_parser.add_argument("--check", action="store_true", help="只做连通性验证")
-    init_parser.add_argument("--title", default=None,
-                             help="笔记本名称（不交互时由 DSH 传入）")
+    init_parser.add_argument("--notebook", default=None,
+                             help="笔记本（同步空间）名称，由 DSH 传入")
+    init_parser.add_argument("--note-title", default=None,
+                             help="交接笔记名称，默认《DSH开发任务交接》")
     init_parser.add_argument("--client-id", default=None, help="写入 Client ID")
     init_parser.add_argument("--api-key", default=None, help="写入 API Key")
     init_parser.add_argument("--keep-credentials", action="store_true",
                              help="沿用现有凭证，不重新输入")
     init_parser.add_argument("--no-verify", action="store_true",
                              help="跳过连通性验证")
+    init_parser.add_argument("--no-create", action="store_true",
+                             help="不创建笔记本（笔记本创建后不可删）")
 
     read_parser = subparsers.add_parser("read", help="读取交接笔记")
-    read_parser.add_argument("--title", default=None, help="笔记标题；省略时用 init 配置的笔记本")
+    read_parser.add_argument("--notebook", default=None, help="笔记本名称；省略时用 init 配置")
+    read_parser.add_argument("--title", default=None, help="笔记标题；省略时用 init 配置")
     read_parser.add_argument("--session", default=None,
                              help="按会话ID过滤，只返回该会话最新一条记录")
     read_parser.add_argument("--all", action="store_true", help="输出全部记录")
@@ -687,7 +817,8 @@ if __name__ == "__main__":
                              help="以结构化 JSON 输出")
 
     write_parser = subparsers.add_parser("write", help="写入交接进度")
-    write_parser.add_argument("--title", default=None, help="笔记标题；省略时用 init 配置的笔记本")
+    write_parser.add_argument("--notebook", default=None, help="笔记本名称；省略时用 init 配置")
+    write_parser.add_argument("--title", default=None, help="笔记标题；省略时用 init 配置")
     write_parser.add_argument("--project", required=True)
     write_parser.add_argument("--content", required=True)
     write_parser.add_argument("--session", default=None,
@@ -699,20 +830,23 @@ if __name__ == "__main__":
     if args.action == "init":
         # 有任一显式参数 → 走非交互模式（DSH 在对话中收集答案后直接执行）
         non_interactive = any([
-            args.title, args.client_id, args.api_key,
-            args.keep_credentials, args.no_verify,
+            args.notebook, args.note_title, args.client_id, args.api_key,
+            args.keep_credentials, args.no_verify, args.no_create,
         ])
         if non_interactive:
             sys.exit(handle_init_apply(
-                title=args.title,
+                notebook=args.notebook,
+                note_title=args.note_title,
                 client_id=args.client_id,
                 api_key=args.api_key,
                 keep_credentials=args.keep_credentials,
                 verify=not args.no_verify,
+                create=not args.no_create,
             ))
         handle_init(args.check)
     elif args.action == "read":
-        handle_read(args.title or default_title(), args.session, args.all, args.as_json)
+        handle_read(args.title or default_title(), args.session, args.all,
+                    args.as_json, args.notebook or default_notebook())
     elif args.action == "write":
         handle_write(args.title or default_title(), args.project, args.content,
-                     args.session, args.host)
+                     args.session, args.host, args.notebook or default_notebook())
