@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本地测试残留
+_testhome*/
+*.log
+
+# 凭证（绝不提交）
+client_id
+api_key
+.config/ima/
