@@ -107,6 +107,34 @@ def _session_cache_path() -> Path:
     return SESSION_CACHE_DIR / f"session-{_workspace_key()}.txt"
 
 
+def _anchor_path() -> Path:
+    """锚点文件：记录本 workspace 当前对话绑定的会话ID。按 workspace 隔离。"""
+    return SESSION_CACHE_DIR / f"anchor-{_workspace_key()}.json"
+
+
+def _load_anchor() -> dict:
+    p = _anchor_path()
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_anchor(sid: str, topic: str) -> None:
+    try:
+        p = _anchor_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "session_id": sid,
+            "topic": topic,
+            "bound_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _save_cache(sid: str) -> None:
     try:
         p = _session_cache_path()
@@ -116,31 +144,51 @@ def _save_cache(sid: str) -> None:
         pass  # 缓存失败不影响主流程
 
 
-def resolve_session(explicit: Optional[str]) -> tuple:
-    """返回 (session_id, 来源)。优先级：--session > 环境变量 > 本地缓存 > 新建随机 ID。
+def resolve_session(explicit: Optional[str], new_session: bool = False) -> tuple:
+    """返回 (session_id, 来源)。
 
-    关键点：自动生成的 ID 必须落盘复用，否则同一工作会话的多次 write 会被
-    拆成多个不同会话，失去按会话过滤的意义。跨电脑要接续同一会话时，必须
-    由 DSH 在两台机器上显式传同一个 --session（语义 ID）。
+    锚点机制（方案1）：
+    - 本 workspace 首次保存 → 用当前对话主题名(explicit)绑定锚点
+    - 之后同一 workspace 再保存 → 即便主题名漂移( describtopic 变了)也沿用锚点ID，
+      保证同一对话多次保存始终追加到同一篇笔记
+    - --new-session → 显式解除旧锚点，用当前主题名重新绑定（真正的新对话）
+    - 环境变量 / 随机短码仅作无主题名时的兜底
+
+    跨电脑接续靠“两端主题名一致 → 笔记标题一致”，不依赖本地锚点。
     """
-    if explicit and explicit.strip():
-        sid = _inline(explicit, 64)
+    topic = _inline(explicit, 80) if explicit and explicit.strip() else ""
+
+    if new_session:
+        sid = topic or "sess-" + uuid.uuid4().hex[:8]
+        _save_anchor(sid, topic)
         _save_cache(sid)
-        return sid, "--session"
-    for var in ("DSH_SESSION_ID", "TERM_SESSION_ID"):
-        val = os.getenv(var, "").strip()
-        if val:
-            sid = _inline(val, 64)
-            _save_cache(sid)
-            return sid, var
-    cached = _session_cache_path()
-    if cached.exists():
-        sid = cached.read_text(encoding="utf-8", errors="ignore").strip()
-        if sid:
-            return _inline(sid, 64), f"cache:{cached.name}"
-    sid = "sess-" + uuid.uuid4().hex[:8]
+        return sid, "new-session(重新绑定)"
+
+    anchor = _load_anchor()
+    bound = (anchor.get("session_id") or "").strip()
+    if bound:
+        # 已有锚点：主题漂移也沿用，只是提示一句
+        if topic and topic != bound:
+            print(
+                f"提示：当前对话主题名为「{topic}」，但本对话首次保存时已绑定「{bound}」。"
+                f"本次继续沿用「{bound}」；若要开启全新对话请加 --new-session。",
+                file=sys.stderr,
+            )
+        return bound, f"anchor(绑定于 {anchor.get('bound_at', '?')})"
+
+    # 无锚点：首次绑定。主题名优先，其次环境变量，最后随机
+    sid = topic
+    if not sid:
+        for var in ("DSH_SESSION_ID", "TERM_SESSION_ID"):
+            val = os.getenv(var, "").strip()
+            if val:
+                sid = _inline(val, 80)
+                break
+    if not sid:
+        sid = "sess-" + uuid.uuid4().hex[:8]
+    _save_anchor(sid, topic)
     _save_cache(sid)
-    return sid, "auto"
+    return sid, "首次绑定"
 
 
 def local_hostname(override: Optional[str] = None) -> str:
@@ -601,9 +649,10 @@ def save_fallback(project: str, session_id: str, host: str, content: str, reason
 
 def handle_write(title: str, project: str, content: str,
                  session: Optional[str], host: Optional[str],
-                 notebook: Optional[str] = None, single_note: bool = False):
+                 notebook: Optional[str] = None, single_note: bool = False,
+                 new_session: bool = False):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    sid, source = resolve_session(session)
+    sid, source = resolve_session(session, new_session=new_session)
     hostname = local_hostname(host)
     clean_content = sanitize_markdown(content)
     header = (
@@ -953,6 +1002,8 @@ if __name__ == "__main__":
                               help="设备名；省略时取本机 hostname")
     write_parser.add_argument("--single-note", action="store_true",
                               help="旧模式：所有会话写进同一篇笔记（默认按会话分笔记）")
+    write_parser.add_argument("--new-session", action="store_true",
+                              help="开启全新对话：解除本 workspace 的会话锚点，用当前主题名重新绑定")
 
     args = parser.parse_args()
     if args.action == "init":
@@ -978,4 +1029,4 @@ if __name__ == "__main__":
     elif args.action == "write":
         handle_write(args.title or default_title(), args.project, args.content,
                      args.session, args.host, args.notebook or default_notebook(),
-                     args.single_note)
+                     args.single_note, args.new_session)
