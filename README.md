@@ -21,7 +21,9 @@ cd ~/.dsh/skills/ima-handoff && git pull
 
 ## 1. 核心能力
 
-- **两层结构**：`《笔记本》/《笔记》`。笔记本是分类容器，笔记存交接记录；两者名称都可自定义。
+- **两层结构 + 按会话分笔记**（默认）：`《笔记本》/《笔记》`，每个会话一篇 `DSH交接-<会话名>`：
+  同会话续写追加、不同会话各自独立，单篇超 300KB 自动分卷。避免单篇无限膨胀拖慢读取。
+  `--single-note` 可退回旧模式（所有会话写进一篇）。
 - **官方端点**：`https://ima.qq.com/openapi/note/v1/` 下的 `search_note`、`list_notebook`、
   `list_note`、`add_notebook`、`get_doc_content`、`append_doc`、`import_doc`。
 - **官方鉴权头**：`ima-openapi-clientid` 与 `ima-openapi-apikey`。
@@ -35,9 +37,9 @@ cd ~/.dsh/skills/ima-handoff && git pull
 - **会话ID 生成/传递**：`--session` 显式指定优先；否则按 `DSH_SESSION_ID` / `TERM_SESSION_ID`
   环境变量 → 本机缓存 → 随机短码 `sess-xxxxxxxx` 兜底。自动生成的 ID 会落盘复用，
   保证同一工作区多次 write 归入同一会话，不会碎片化。
-- **按会话精准读取**：`read --session <ID>` 只返回该会话最新一条完整记录；不带参数则返回
-  最近 3 个不同会话的摘要索引（`--all` 全部，`--json` 结构化）。
-- **并发安全**：多窗口各带自己的会话ID 往同一篇笔记追加，时间线独立、互不覆盖。
+- **按会话精准读取**：`read --session <ID>` 只拉该会话的笔记并返回最新一条完整记录；
+  不带参数则返回最近 3 个不同会话的摘要索引（`--all` 全部，`--json` 结构化）。
+- **并发安全**：每个会话独立成篇，多窗口并发互不覆盖，读取成本不随总记录数增长。
 - **降级保护**：网络异常 / 配额耗尽时自动暂存至 `~/.dsh/handoff_fallback.md`。
 
 ## 2. 安装部署
@@ -84,11 +86,15 @@ python3 ~/.dsh/skills/ima-handoff/ima_sync.py write \
 # 不传 --session：脚本自动兜底并打印本次 ID
 python3 ~/.dsh/skills/ima-handoff/ima_sync.py write --project "my-app" --content "连通性验证"
 
-# 读取：先看索引，再按会话拉取最新完整记录
+# 读取：先看索引，再按会话拉取最新完整记录（只读该会话的笔记）
 python3 ~/.dsh/skills/ima-handoff/ima_sync.py read
 python3 ~/.dsh/skills/ima-handoff/ima_sync.py read --session "feat-login-01"
 python3 ~/.dsh/skills/ima-handoff/ima_sync.py read --all
 python3 ~/.dsh/skills/ima-handoff/ima_sync.py read --json
+
+# 旧模式：所有会话写进同一篇 / 从单篇读取（读历史数据用）
+python3 ~/.dsh/skills/ima-handoff/ima_sync.py write --project my-app --content "..." --session "x" --single-note
+python3 ~/.dsh/skills/ima-handoff/ima_sync.py read --single-note
 ```
 
 DSH 内触发：

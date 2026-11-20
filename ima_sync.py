@@ -16,6 +16,8 @@ from typing import Dict, List, Optional
 BASE_URL = os.getenv("IMA_BASE_URL", "https://ima.qq.com").rstrip("/")
 DEFAULT_NOTEBOOK = "DSH内容同步空间"
 DEFAULT_TITLE = "DSH开发任务交接"
+NOTE_PREFIX = "DSH交接-"          # 方案C：按会话分笔记时的标题前缀
+VOLUME_LIMIT_BYTES = 300 * 1024   # 单卷上限，超过则新建 -2/-3 卷
 FALLBACK_FILE = Path.home() / ".dsh" / "handoff_fallback.md"
 SESSION_CACHE_DIR = Path.home() / ".dsh" / "handoff_sessions"
 CONFIG_FILE = Path.home() / ".dsh" / "handoff_config.json"
@@ -426,6 +428,67 @@ def print_fallback() -> None:
 
 # ------------------------------ 命令处理 ------------------------------
 
+def session_note_title(session_id: str, project: str = "") -> str:
+    """方案C：由会话名生成笔记标题。
+
+    优先语义会话名（feat-login-01），随机短码 sess-xxxxxxxx 则附加项目名和日期，
+    避免 ima 客户端里出现一堆难辨的随机标题。
+    """
+    sid = (session_id or "").strip()
+    if sid.startswith("sess-") and len(sid) <= 14:
+        suffix = _inline(project, 24) or "交接"
+        sid = f"{suffix}-{sid}"  # 保留完整 sess-xxxxxxxx，便于读取时按会话匹配
+    return NOTE_PREFIX + _inline(sid, 60)
+
+
+def list_note_titles(folder_id: str) -> List[Dict]:
+    """列出笔记本内所有笔记（title/note_id/modify_time），用于索引与分卷定位。"""
+    out: List[Dict] = []
+    cursor = ""
+    for _ in range(20):
+        res = request_ima(
+            "/openapi/note/v1/list_note",
+            {"folder_id": folder_id, "sort_type": 0, "cursor": cursor, "limit": 20},
+        )
+        data = res.get("data", {}) or {}
+        for nb in data.get("note_book_list") or []:
+            out.append({
+                "note_id": nb.get("note_id") or "",
+                "title": (nb.get("title") or "").strip(),
+                "modify_time": nb.get("modify_time") or "",
+            })
+        if data.get("is_end"):
+            break
+        cursor = data.get("next_cursor") or ""
+        if not cursor:
+            break
+    return out
+
+
+def find_note_volume(folder_id: str, base_title: str) -> tuple:
+    """找到某会话最新的分卷 (note_id, title, 卷号)。
+
+    卷命名：base / base-2 / base-3 …；返回最后一卷（追加目标）。
+    卷号用 re.fullmatch 锚定 base_title + -N，避免会话名本身以数字结尾时误判。
+    """
+    notes = list_note_titles(folder_id)
+    candidates = {}
+    for nb in notes:
+        t = nb["title"]
+        if t == base_title:
+            candidates[1] = nb
+        else:
+            m = re.fullmatch(re.escape(base_title) + r"-(\d+)", t)
+            if m:
+                candidates[int(m.group(1))] = nb
+    if not candidates:
+        return "", base_title, 0
+    vol = max(candidates)
+    nb = candidates[vol]
+    title = base_title if vol == 1 else f"{base_title}-{vol}"
+    return nb["note_id"], title, vol
+
+
 def resolve_note(title: str, notebook: Optional[str] = None,
                  create_notebook_if_missing: bool = False) -> tuple:
     """解析出 (note_id, folder_id)。
@@ -446,25 +509,58 @@ def resolve_note(title: str, notebook: Optional[str] = None,
     return find_note_id(title), folder_id
 
 
+def _read_note_blocks(note_id: str) -> List[Dict]:
+    res = request_ima(
+        "/openapi/note/v1/get_doc_content",
+        {"note_id": note_id, "target_content_format": 1},
+    )
+    return parse_blocks(_extract_content(res.get("data", res)))
+
+
 def handle_read(title: str, session: Optional[str], show_all: bool, as_json: bool,
-                notebook: Optional[str] = None):
+                notebook: Optional[str] = None, single_note: bool = False):
     try:
-        note_id, folder_id = resolve_note(title, notebook)
-        if not note_id:
+        folder_id = find_notebook_id(notebook) if notebook else ""
+        all_blocks: List[Dict] = []
+        session_title = ""
+
+        if not single_note and folder_id:
+            # 方案C：从笔记本列出交接笔记；指定会话则只读该会话的卷
+            notes = list_note_titles(folder_id)
+            handoff_notes = [n for n in notes if n["title"].startswith(NOTE_PREFIX)]
+            if session:
+                base = session_note_title(session)
+                matched = [n for n in handoff_notes
+                           if n["title"] == base or n["title"].startswith(base + "-")]
+                if not matched:
+                    # 兼容旧数据：标题里含会话名的笔记
+                    matched = [n for n in notes if session in n["title"]]
+                targets = matched
+            elif show_all or as_json:
+                targets = handoff_notes
+            else:
+                targets = handoff_notes
+
+            for n in targets:
+                all_blocks.extend(_read_note_blocks(n["note_id"]))
+            session_title = f"笔记本《{notebook}》"
+        else:
+            # 兼容旧模式 / 无笔记本：单篇读取
+            note_id, folder_id = resolve_note(title, notebook)
+            if note_id:
+                all_blocks = _read_note_blocks(note_id)
+
+        if not all_blocks:
             where = f"笔记本《{notebook}》中" if notebook else "云端"
-            print(f"{where}暂未找到标题为《{title}》的交接笔记。")
+            print(f"{where}暂未找到交接记录。"
+                  + (f"（会话「{session}」）" if session else ""))
             print_fallback()
             return
-        res = request_ima(
-            "/openapi/note/v1/get_doc_content",
-            {"note_id": note_id, "target_content_format": 1},
-        )
-        data = res.get("data", res)
-        blocks = parse_blocks(_extract_content(data))
 
+        blocks = all_blocks
         if as_json:
             print(json.dumps(
-                {"title": title, "note_id": note_id, "count": len(blocks), "blocks": blocks},
+                {"notebook": notebook, "count": len(blocks), "blocks": blocks},
                 ensure_ascii=False, indent=2,
             ))
             return
@@ -474,12 +570,12 @@ def handle_read(title: str, session: Optional[str], show_all: bool, as_json: boo
                 print(f"未找到会话ID 为「{session}」的记录。\n")
                 print(index_text(blocks))
                 return
-            latest = hits[-1]  # 文档追加顺序 => 最后一条即最新
+            latest = hits[-1]
             print(f"=== 会话「{session}」最新交接记录（该会话共 {len(hits)} 条）===")
             print(render_block(latest))
             return
         if show_all:
-            print(f"=== 《{title}》全部 {len(blocks)} 条记录 ===")
+            print(f"=== {session_title or '全部'} 全部 {len(blocks)} 条记录 ===")
             for i, b in enumerate(blocks, 1):
                 print(f"\n[{i}] {render_block(b)}")
             return
@@ -505,7 +601,7 @@ def save_fallback(project: str, session_id: str, host: str, content: str, reason
 
 def handle_write(title: str, project: str, content: str,
                  session: Optional[str], host: Optional[str],
-                 notebook: Optional[str] = None):
+                 notebook: Optional[str] = None, single_note: bool = False):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sid, source = resolve_session(session)
     hostname = local_hostname(host)
@@ -518,33 +614,61 @@ def handle_write(title: str, project: str, content: str,
 
     print(f"本次会话ID：{sid}（来源：{source}）；设备：{hostname}")
     try:
-        note_id, folder_id = resolve_note(
-            title, notebook, create_notebook_if_missing=True
-        )
+        if single_note:
+            # 兼容旧模式：所有会话写进同一篇笔记
+            note_id, folder_id = resolve_note(
+                title, notebook, create_notebook_if_missing=True
+            )
+            target_title = title
+        else:
+            # 方案C：按会话分笔记
+            folder_id = (ensure_notebook(notebook) if notebook else "")
+            base_title = session_note_title(sid, project)
+            note_id, target_title, cur_vol = find_note_volume(folder_id, base_title)
+
+        vol_size = 0
         if note_id:
-            # 官方标准：append_doc 传入 note_id, content, content_format=1 (Markdown)
+            # 读取当前卷正文，估算追加后大小；超阈值则新建下一卷
+            try:
+                cur = request_ima(
+                    "/openapi/note/v1/get_doc_content",
+                    {"note_id": note_id, "target_content_format": 1},
+                )
+                vol_size = len((_extract_content(cur.get("data", cur)) or "").encode("utf-8"))
+            except Exception:
+                vol_size = 0
+
+        need_new_volume = (
+            not single_note and note_id
+            and vol_size + len(formatted_block.encode("utf-8")) > VOLUME_LIMIT_BYTES
+        )
+
+        if need_new_volume:
+            # 用 find_note_volume 返回的明确卷号 +1，不解析标题（会话名可能以数字结尾）
+            next_vol = (cur_vol or 1) + 1
+            target_title = f"{base_title}-{next_vol}"
+            note_id = ""
+            print(f"当前卷已达上限，新建分卷：{target_title}")
+
+        if note_id:
             res = request_ima(
                 "/openapi/note/v1/append_doc",
                 {"note_id": note_id, "content": formatted_block, "content_format": 1},
             )
-            loc = f"笔记本《{notebook}》" if notebook else "云端"
-            print(
-                f"已追加同步至{loc}笔记《{title}》(note_id={note_id})："
-                f"{json.dumps(res.get('data', {}), ensure_ascii=False)}"
-            )
         else:
-            # 官方标准：import_doc 无 title 字段，标题取正文首行 "# 标题"
-            full_md = f"# {title}\n{formatted_block}"
+            full_md = f"# {target_title}\n{formatted_block}"
             payload = {"content": full_md, "content_format": 1}
             if folder_id:
-                payload["folder_id"] = folder_id  # 直接建到指定笔记本
+                payload["folder_id"] = folder_id
             res = request_ima("/openapi/note/v1/import_doc", payload)
             note_id = (res.get("data") or {}).get("note_id") or ""
-            loc = f"笔记本《{notebook}》" if notebook else "云端"
-            print(
-                f"已新建并同步至{loc}笔记《{title}》(note_id={note_id})："
-                f"{json.dumps(res.get('data', {}), ensure_ascii=False)}"
-            )
+
+        loc = f"笔记本《{notebook}》" if notebook else "云端"
+        mode = "单篇" if single_note else "按会话"
+        print(
+            f"已同步[{mode}]至{loc}笔记《{target_title}》(note_id={note_id})："
+            f"{json.dumps(res.get('data', {}), ensure_ascii=False)}"
+        )
         print(f"写入完成。本次会话后续继续带 --session {sid} 即可归入同一会话。")
     except Exception as e:
         err_str = str(e)
@@ -815,6 +939,8 @@ if __name__ == "__main__":
     read_parser.add_argument("--all", action="store_true", help="输出全部记录")
     read_parser.add_argument("--json", action="store_true", dest="as_json",
                              help="以结构化 JSON 输出")
+    read_parser.add_argument("--single-note", action="store_true",
+                             help="旧模式：从单篇笔记读取（默认按会话分笔记）")
 
     write_parser = subparsers.add_parser("write", help="写入交接进度")
     write_parser.add_argument("--notebook", default=None, help="笔记本名称；省略时用 init 配置")
@@ -825,6 +951,8 @@ if __name__ == "__main__":
                               help="会话ID；省略时按 环境变量>缓存>随机 兜底")
     write_parser.add_argument("--host", default=None,
                               help="设备名；省略时取本机 hostname")
+    write_parser.add_argument("--single-note", action="store_true",
+                              help="旧模式：所有会话写进同一篇笔记（默认按会话分笔记）")
 
     args = parser.parse_args()
     if args.action == "init":
@@ -846,7 +974,8 @@ if __name__ == "__main__":
         handle_init(args.check)
     elif args.action == "read":
         handle_read(args.title or default_title(), args.session, args.all,
-                    args.as_json, args.notebook or default_notebook())
+                    args.as_json, args.notebook or default_notebook(), args.single_note)
     elif args.action == "write":
         handle_write(args.title or default_title(), args.project, args.content,
-                     args.session, args.host, args.notebook or default_notebook())
+                     args.session, args.host, args.notebook or default_notebook(),
+                     args.single_note)
